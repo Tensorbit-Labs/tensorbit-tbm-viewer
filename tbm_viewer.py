@@ -11,6 +11,8 @@ avoid loading gigabytes into memory).
 import struct
 import json
 import os
+import re
+import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Optional
@@ -315,6 +317,31 @@ class TbmViewerApp:
         mask_frame.rowconfigure(0, weight=1)
         mask_frame.columnconfigure(0, weight=1)
 
+        # tab: architecture diagram
+        self._build_architecture_tab()
+
+    def _build_architecture_tab(self):
+        """Build the Architecture diagram tab."""
+        arch_frame = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(arch_frame, text="Architecture")
+
+        self.arch_canvas = tk.Canvas(arch_frame, bg="#1a1a2e", highlightthickness=0)
+        h_scroll = ttk.Scrollbar(arch_frame, orient=tk.HORIZONTAL,
+                                 command=self.arch_canvas.xview)
+        v_scroll = ttk.Scrollbar(arch_frame, orient=tk.VERTICAL,
+                                 command=self.arch_canvas.yview)
+        self.arch_canvas.configure(xscrollcommand=h_scroll.set,
+                                    yscrollcommand=v_scroll.set)
+        self.arch_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        arch_frame.rowconfigure(0, weight=1)
+        arch_frame.columnconfigure(0, weight=1)
+
+        self.arch_canvas.bind("<Button-1>", self._on_arch_click)
+        self._arch_data = None
+        self._arch_expanded = {}
+
     # ── View switching ──────────────────────
 
     def _show_welcome(self):
@@ -377,6 +404,7 @@ class TbmViewerApp:
         self.filtered_tensors = list(range(len(self.tensors)))
         self._show_main()
         self._update_summary_panel()
+        self._render_diagram()
 
     def _apply_filter(self):
         """Filter the treeview by search text."""
@@ -567,6 +595,426 @@ class TbmViewerApp:
                 f"{fname}  |  {num} tensors  |  "
                 f"architecture: {arch}  |  "
                 f"{size_mb:.0f} MB  |  {total_wts:,} total weights")
+
+    # ── Architecture diagram ─────────────────
+
+    def _infer_architecture(self):
+        """Parse tensor names into a structured layer graph.
+
+        Returns a dict with:
+          - 'embed':     list of embedding tensors
+          - 'layers':    list of dicts, each with 'attn', 'mlp', 'norms' lists
+          - 'final_norm': list of final normalization tensors
+          - 'lm_head':   list of lm_head tensors
+          - 'other':     any tensors that don't match known patterns
+        """
+        layers = []
+        special = {'embed': [], 'final_norm': [], 'lm_head': [], 'other': []}
+
+        for t in self.tensors:
+            name = t.get('name', '')
+            if not name:
+                special['other'].append(t)
+                continue
+
+            if 'embed' in name.lower():
+                special['embed'].append(t)
+            elif name == 'model.norm.weight' or name.endswith('.norm.weight'):
+                special['final_norm'].append(t)
+            elif 'lm_head' in name:
+                special['lm_head'].append(t)
+            elif 'layers.' in name:
+                m = re.search(r'layers\.(\d+)', name)
+                if m:
+                    idx = int(m.group(1))
+                    while len(layers) <= idx:
+                        layers.append({'index': len(layers),
+                                       'attn': [], 'mlp': [], 'norms': []})
+                    if 'self_attn' in name or 'attention' in name:
+                        layers[idx]['attn'].append(t)
+                    elif 'mlp' in name or 'feed_forward' in name:
+                        layers[idx]['mlp'].append(t)
+                    elif 'norm' in name.lower() or 'layernorm' in name.lower():
+                        layers[idx]['norms'].append(t)
+                    else:
+                        layers[idx]['attn'].append(t)
+                else:
+                    special['other'].append(t)
+            else:
+                special['other'].append(t)
+
+        # Sort sub-tensors within each group by name for consistent layout
+        for layer in layers:
+            for key in ('attn', 'mlp', 'norms'):
+                layer[key].sort(key=lambda x: x.get('name', ''))
+
+        for key in ('embed', 'final_norm', 'lm_head', 'other'):
+            special[key].sort(key=lambda x: x.get('name', ''))
+
+        return {'layers': layers, 'special': special}
+
+    _ARCH_COLORS = {
+        'embed':       '#4A90D9',
+        'q_proj':      '#50C878',
+        'k_proj':      '#3CB371',
+        'v_proj':      '#2E8B57',
+        'o_proj':      '#66CDAA',
+        'attn':        '#50C878',
+        'gate_proj':   '#FF8C42',
+        'up_proj':     '#FF7B25',
+        'down_proj':   '#E06930',
+        'mlp':         '#FF8C42',
+        'norm':        '#9B9B9B',
+        'final_norm':  '#7B8D9E',
+        'lm_head':     '#E74C3C',
+        'other':       '#888888',
+    }
+
+    _ARCH_GROUP_LABELS = {
+        'embed':       'Embedding',
+        'attn':        'Self-Attention',
+        'mlp':         'MLP (FFN)',
+        'norms':       'LayerNorm',
+        'final_norm':  'Final Norm',
+        'lm_head':     'LM Head',
+        'other':       'Other',
+    }
+
+    @staticmethod
+    def _role_of_tensor(name: str, group: str) -> str:
+        """Return a short role label for a tensor within its group."""
+        for kw in ('q_proj', 'k_proj', 'v_proj', 'o_proj',
+                   'gate_proj', 'up_proj', 'down_proj',
+                    'embed', 'lm_head', 'norm'):
+            if kw in name:
+                return kw
+        return group
+
+    @staticmethod
+    def _color_of(name: str, group: str) -> str:
+        role = TbmViewerApp._role_of_tensor(name, group)
+        return TbmViewerApp._ARCH_COLORS.get(role,
+                TbmViewerApp._ARCH_COLORS.get(group, '#888888'))
+
+    @staticmethod
+    def _short_name(name: str) -> str:
+        """Extract a compact label from a tensor name."""
+        name = name.replace('model.', '').replace('.weight', '')
+        name = re.sub(r'layers\.\d+\.', '', name)
+        return name
+
+    def _render_diagram(self):
+        """Draw the architecture diagram on the canvas."""
+        canvas = self.arch_canvas
+        canvas.delete('all')
+        self._arch_data = None
+        self._arch_expanded = {}
+
+        if not self.tensors:
+            canvas.create_text(400, 100, text="(no tensors loaded)",
+                               fill="#888888", font=("TkDefaultFont", 14))
+            canvas.configure(scrollregion=(0, 0, 800, 200))
+            return
+
+        arch = self._infer_architecture()
+        self._arch_data = arch
+
+        layers = arch['layers']
+        special = arch['special']
+        num_layers = len(layers)
+
+        if num_layers == 0:
+            canvas.create_text(400, 100, text="(no layer structure detected)",
+                               fill="#888888", font=("TkDefaultFont", 14))
+            canvas.configure(scrollregion=(0, 0, 800, 200))
+            return
+
+        # Layout constants
+        W = 720
+        X0 = 40
+        X_MID = X0 + W // 2
+        BOX_W = 130
+        BOX_H = 28
+        GAP_X = 10
+        GAP_Y = 14
+        LAYER_PAD_Y = 10
+        ARROW_COLOR = "#AAAAAA"
+        TEXT_COLOR = "#E0E0E0"
+        HEADER_COLOR = "#333355"
+        HEADER_H = 24
+
+        y = 20
+        item_tags = {}
+
+        # --- Legend ---
+        legend_x = X0 + W - 200
+        ly = y
+        canvas.create_text(legend_x + 60, ly, text="Legend",
+                           fill="#BBBBBB", font=("TkDefaultFont", 10, "bold"),
+                           anchor=tk.N)
+        ly += 16
+        legend_items = [
+            ('Attention', '#50C878'), ('MLP', '#FF8C42'),
+            ('Norm', '#9B9B9B'), ('Embed', '#4A90D9'),
+            ('LM Head', '#E74C3C'),
+        ]
+        for ltext, lcolor in legend_items:
+            canvas.create_rectangle(legend_x, ly, legend_x + 14, ly + 10,
+                                    fill=lcolor, outline=lcolor)
+            canvas.create_text(legend_x + 18, ly + 5, text=ltext,
+                               fill="#BBBBBB", font=("TkDefaultFont", 9),
+                               anchor=tk.W)
+            ly += 14
+
+        # --- Embedding ---
+        y += 4
+        if special['embed']:
+            y = self._draw_group_header(canvas, X0, y, W,
+                                         TbmViewerApp._ARCH_GROUP_LABELS['embed'],
+                                         '#4A90D9')
+            for t in special['embed']:
+                y = self._draw_tensor_box(canvas, X_MID - BOX_W // 2, y,
+                                           BOX_W, BOX_H, t, 'embed')
+                y += GAP_Y
+            y += 8
+            self._draw_arrow(canvas, X_MID, y - 4, X_MID, y + 10)
+            y += 14
+
+        # --- Layer blocks ---
+        total_layers = len(layers)
+        for li, ldata in enumerate(layers):
+            lnum = ldata['index']
+            num_sub = (len(ldata['norms']) + len(ldata['attn'])
+                       + len(ldata['mlp']))
+            header_text = f"Layer {lnum}  ({num_sub} tensors)"
+            expanded = self._arch_expanded.get(lnum, num_sub <= 12)
+
+            y = self._draw_group_header(canvas, X0, y, W, header_text,
+                                         HEADER_COLOR, lnum, expanded)
+
+            if expanded:
+                # Norms first
+                for tn in ldata['norms']:
+                    y = self._draw_tensor_box(canvas, X_MID - BOX_W // 2, y,
+                                               BOX_W, BOX_H, tn, 'norms')
+                    y += GAP_Y
+                y -= GAP_Y
+
+                # Attention group
+                if ldata['attn']:
+                    y += 4
+                    mx = X_MID - (len(ldata['attn']) * (BOX_W + GAP_X) - GAP_X) // 2
+                    for ti, ta in enumerate(ldata['attn']):
+                        bx = mx + ti * (BOX_W + GAP_X)
+                        y2 = self._draw_tensor_box(canvas, bx, y, BOX_W, BOX_H,
+                                                    ta, 'attn')
+                        if ti < len(ldata['attn']) - 1:
+                            self._draw_arrow(canvas,
+                                             bx + BOX_W // 2, y2,
+                                             bx + BOX_W // 2 + BOX_W + GAP_X, y2)
+                    y = y2 + GAP_Y
+
+                # MLP group
+                if ldata['mlp']:
+                    y += 4
+                    mx = X_MID - (len(ldata['mlp']) * (BOX_W + GAP_X) - GAP_X) // 2
+                    for ti, tm in enumerate(ldata['mlp']):
+                        bx = mx + ti * (BOX_W + GAP_X)
+                        y = self._draw_tensor_box(canvas, bx, y, BOX_W, BOX_H,
+                                                   tm, 'mlp')
+                        if ti < len(ldata['mlp']) - 1:
+                            self._draw_arrow(canvas,
+                                             bx + BOX_W // 2, y + BOX_H,
+                                             bx + BOX_W // 2 + BOX_W + GAP_X, y + BOX_H)
+                    y += GAP_Y
+
+            y += LAYER_PAD_Y
+
+            if li < total_layers - 1:
+                self._draw_arrow(canvas, X_MID, y, X_MID, y + 16)
+                y += 20
+
+        # --- Final Norm ---
+        if special['final_norm']:
+            y += 4
+            y = self._draw_group_header(canvas, X0, y, W,
+                                         TbmViewerApp._ARCH_GROUP_LABELS['final_norm'],
+                                         '#7B8D9E')
+            for t in special['final_norm']:
+                y = self._draw_tensor_box(canvas, X_MID - BOX_W // 2, y,
+                                           BOX_W, BOX_H, t, 'final_norm')
+                y += GAP_Y
+            y += 4
+            self._draw_arrow(canvas, X_MID, y, X_MID, y + 14)
+            y += 18
+
+        # --- LM Head ---
+        if special['lm_head']:
+            y = self._draw_group_header(canvas, X0, y, W,
+                                         TbmViewerApp._ARCH_GROUP_LABELS['lm_head'],
+                                         '#E74C3C')
+            for t in special['lm_head']:
+                y = self._draw_tensor_box(canvas, X_MID - BOX_W // 2, y,
+                                           BOX_W, BOX_H, t, 'lm_head')
+                y += GAP_Y
+
+        # --- Others ---
+        if special['other']:
+            y += 12
+            y = self._draw_group_header(canvas, X0, y, W, 'Other Tensors',
+                                         '#555555')
+            for t in special['other']:
+                y = self._draw_tensor_box(canvas, X_MID - BOX_W // 2, y,
+                                           BOX_W, BOX_H, t, 'other')
+                y += GAP_Y
+
+        y += 30
+        model_name = self.index.get('architecture', 'model') if self.index else 'model'
+        canvas.create_text(X_MID, y,
+                           text=f"{model_name} — {num_layers} layers, "
+                                f"{len(self.tensors)} tensors",
+                           fill="#666688", font=("TkDefaultFont", 10, "italic"))
+        y += 30
+
+        canvas.configure(scrollregion=(0, 0, max(X0 + W, 820), y))
+
+    def _draw_group_header(self, canvas, x, y, w, text, color,
+                            lnum=None, expanded=True):
+        """Draw a collapsible group header. Returns new y after the header."""
+        h = 24
+        r = 6
+        box_id = canvas.create_rectangle(x, y, x + w, y + h,
+                                          fill=color, outline=color,
+                                          stipple='gray25' if not expanded else '')
+        toggle = '+' if not expanded else '-'
+        canvas.create_text(x + 14, y + h // 2, text=toggle,
+                           fill="white", font=("TkDefaultFont", 11, "bold"),
+                           anchor=tk.W)
+        canvas.create_text(x + 30, y + h // 2, text=text,
+                           fill="white",
+                           font=("TkDefaultFont", 10, "bold"),
+                           anchor=tk.W)
+        if lnum is not None:
+            tag = f"layer_hdr_{lnum}"
+            canvas.tag_bind(box_id, "<Button-1>",
+                            lambda e, ln=lnum: self._toggle_layer(ln))
+            canvas.tag_bind(toggle, "<Button-1>",
+                            lambda e, ln=lnum: self._toggle_layer(ln))
+        return y + h + 6
+
+    def _toggle_layer(self, lnum: int):
+        self._arch_expanded[lnum] = not self._arch_expanded.get(lnum, True)
+        self._render_diagram()
+
+    def _draw_tensor_box(self, canvas, x, y, w, h, tensor, group):
+        """Draw a single tensor rectangle on the canvas. Returns new y."""
+        name = tensor.get('name', '?')
+        short = TbmViewerApp._short_name(name)
+        color = TbmViewerApp._color_of(name, group)
+        shape = tensor.get('shape', [])
+        nw = tensor.get('num_weights', 0)
+        shape_str = '×'.join(str(d) for d in shape) if shape else '?'
+        r = 5
+        box_id = canvas.create_rectangle(x, y, x + w, y + h,
+                                          fill=color, outline=color)
+        label = short[:18] + ('..' if len(short) > 18 else '')
+        canvas.create_text(x + w // 2, y + h // 2,
+                           text=label, fill="white",
+                           font=("TkDefaultFont", 9, "bold"))
+        info = f"{shape_str}  {nw:,}"
+        canvas.create_text(x + w // 2, y - 2,
+                           text=info, fill="#999999",
+                           font=("TkDefaultFont", 7), anchor=tk.S)
+        idx = self.tensors.index(tensor) if tensor in self.tensors else -1
+        canvas.tag_bind(box_id, "<Button-1>",
+                        lambda e, i=idx: self._show_heatmap(i))
+        return y + h
+
+    def _draw_arrow(self, canvas, x1, y1, x2, y2):
+        """Draw a downward arrow."""
+        canvas.create_line(x1, y1, x2, y2 - 5, fill="#666688", width=2,
+                           arrow=tk.LAST, arrowshape=(8, 10, 4))
+
+    def _on_arch_click(self, event):
+        """Handler for canvas clicks — identify item and dispatch."""
+        pass
+
+    def _show_heatmap(self, tensor_idx: int):
+        """Show a heatmap popup of the first K*K weights of a tensor."""
+        if tensor_idx < 0 or tensor_idx >= len(self.tensors):
+            return
+        if not self.tbm_path:
+            return
+
+        tensor = self.tensors[tensor_idx]
+        nw = tensor.get('num_weights', 0)
+        dtype = tensor.get('dtype', 'fp32')
+        offset = tensor.get('offset', 0)
+
+        side = min(int(math.sqrt(min(nw, 4096))), 48)
+        if side < 2:
+            return
+        count = side * side
+
+        vals = preview_tensor(self.tbm_path, offset, nw, dtype, count)
+        if vals is None or len(vals) < 2:
+            return
+
+        max_abs = max(abs(v) for v in vals if math.isfinite(v))
+        if max_abs == 0:
+            max_abs = 1.0
+
+        popup = tk.Toplevel(self.root)
+        popup.title(f"Heatmap — {TbmViewerApp._short_name(tensor.get('name', '?'))}")
+        popup.resizable(False, False)
+
+        CELL = 12
+        pad = 8
+        canvas_w = side * CELL + pad * 2
+        canvas_h = side * CELL + pad * 2 + 24
+
+        hc = tk.Canvas(popup, width=canvas_w, height=canvas_h,
+                       bg="#0d0d1a", highlightthickness=0)
+        hc.pack()
+
+        for row in range(side):
+            for col in range(side):
+                v = vals[row * side + col]
+                if not math.isfinite(v):
+                    r, g, b = 100, 100, 100
+                else:
+                    t = v / max_abs
+                    t = max(-1.0, min(1.0, t))
+                    if t >= 0:
+                        r = int(30 + 225 * t)
+                        g = int(30 + 60 * (1 - t))
+                        b = int(60 + 60 * (1 - t))
+                    else:
+                        t = -t
+                        r = int(60 + 60 * (1 - t))
+                        g = int(30 + 60 * (1 - t))
+                        b = int(30 + 225 * t)
+
+                hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                px = pad + col * CELL
+                py = pad + row * CELL
+
+                hc.create_rectangle(px, py, px + CELL - 1, py + CELL - 1,
+                                    fill=hex_color, outline=hex_color)
+
+        name = TbmViewerApp._short_name(tensor.get('name', '?'))
+        shape = tensor.get('shape', [])
+        shape_str = '×'.join(str(d) for d in shape) if shape else '?'
+        sp = 0.0
+        nm_n = tensor.get('nm_n')
+        nm_m = tensor.get('nm_m')
+        if isinstance(nm_n, (int, float)) and isinstance(nm_m, (int, float)) and nm_m > 0:
+            sp = 1.0 - (nm_n / nm_m)
+
+        hc.create_text(pad + (side * CELL) // 2, canvas_h - 6,
+                       text=f"{name}  {shape_str}  {sp:.0%} sparse  "
+                            f"[±{max_abs:.3f}]",
+                       fill="#888888", font=("TkDefaultFont", 8))
 
 
 # ──────────────────────────────────────────────
