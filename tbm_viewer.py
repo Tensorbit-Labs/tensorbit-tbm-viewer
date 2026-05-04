@@ -342,9 +342,12 @@ class TbmViewerApp:
         self.arch_canvas.bind("<MouseWheel>", self._on_arch_mousewheel)
         self.arch_canvas.bind("<Button-4>", self._on_arch_mousewheel_linux)
         self.arch_canvas.bind("<Button-5>", self._on_arch_mousewheel_linux)
+        self.arch_canvas.bind("<Motion>", self._on_arch_motion)
+        self.arch_canvas.bind("<Leave>", self._on_arch_canvas_leave)
         self._arch_data = None
         self._arch_expanded = {}
-        self._arch_hover_color = {}
+        self._arch_tag_colors = {}
+        self._current_hover_tag = None
 
     # ── View switching ──────────────────────
 
@@ -711,6 +714,8 @@ class TbmViewerApp:
         """Draw the architecture diagram on the canvas."""
         canvas = self.arch_canvas
         canvas.delete('all')
+        self._arch_tag_colors.clear()
+        self._current_hover_tag = None
 
         if not self.tensors:
             canvas.create_text(400, 100, text="(no tensors loaded)",
@@ -902,12 +907,9 @@ class TbmViewerApp:
                            anchor=tk.W, tags=(tag,))
 
         if is_layer:
+            self._arch_tag_colors[tag] = color
             canvas.tag_bind(tag, "<Button-1>",
                             lambda e, ln=lnum: self._toggle_layer(ln))
-            canvas.tag_bind(tag, "<Enter>",
-                            lambda e, c=color: self._on_item_enter(e, c))
-            canvas.tag_bind(tag, "<Leave>",
-                            lambda e, c=color: self._on_item_leave(e, c))
         return y + h + 6
 
     def _toggle_layer(self, lnum: int):
@@ -942,12 +944,9 @@ class TbmViewerApp:
                            tags=(tag,))
 
         if idx >= 0:
+            self._arch_tag_colors[tag] = color
             canvas.tag_bind(tag, "<Button-1>",
                             lambda e, i=idx: self._show_heatmap(i))
-            canvas.tag_bind(tag, "<Enter>",
-                            lambda e, c=color: self._on_item_enter(e, c))
-            canvas.tag_bind(tag, "<Leave>",
-                            lambda e, c=color: self._on_item_leave(e, c))
         return y + h
 
     def _draw_arrow(self, canvas, x1, y1, x2, y2):
@@ -970,29 +969,59 @@ class TbmViewerApp:
         elif event.num == 5:
             self.arch_canvas.yview_scroll(1, "units")
 
-    def _on_item_enter(self, event, orig_color):
-        """Brighten a canvas item on mouse hover."""
-        items = self.arch_canvas.find_withtag("current")
-        for item_id in items:
-            item_type = self.arch_canvas.type(item_id)
-            if item_type == "rectangle":
-                r = int(orig_color[1:3], 16)
-                g = int(orig_color[3:5], 16)
-                b = int(orig_color[5:7], 16)
-                r = min(255, r + 40)
-                g = min(255, g + 40)
-                b = min(255, b + 40)
-                hl = f"#{r:02x}{g:02x}{b:02x}"
-                self.arch_canvas.itemconfigure(item_id, fill=hl, outline=hl)
+    def _on_arch_canvas_leave(self, event):
+        """Unhover when mouse leaves the canvas entirely."""
+        self._set_hover_tag(None)
 
-    def _on_item_leave(self, event, orig_color):
-        """Restore original color on mouse leave."""
-        items = self.arch_canvas.find_withtag("current")
-        for item_id in items:
-            item_type = self.arch_canvas.type(item_id)
-            if item_type == "rectangle":
-                self.arch_canvas.itemconfigure(item_id, fill=orig_color,
-                                                outline=orig_color)
+    def _on_arch_motion(self, event):
+        """Track which tag (tbox_ or ghdr_) the mouse is over.  Only re-
+        highlight when the tag actually changes — prevents blinking when
+        cursor moves between items that share the same tag."""
+        canvas = self.arch_canvas
+        cx = canvas.canvasx(event.x)
+        cy = canvas.canvasy(event.y)
+        items = canvas.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2)
+        found = None
+        for iid in items:
+            for t in canvas.gettags(iid):
+                if t.startswith('tbox_') or t.startswith('ghdr_'):
+                    found = t
+                    break
+            if found:
+                break
+        self._set_hover_tag(found)
+
+    def _set_hover_tag(self, new_tag):
+        """Switch hover highlight to new_tag (None = unhover)."""
+        if new_tag == self._current_hover_tag:
+            return
+        canvas = self.arch_canvas
+
+        if (self._current_hover_tag and
+                self._current_hover_tag in self._arch_tag_colors):
+            orig = self._arch_tag_colors[self._current_hover_tag]
+            self._apply_tag_color(canvas, self._current_hover_tag,
+                                   orig, orig)
+
+        if new_tag and new_tag in self._arch_tag_colors:
+            orig = self._arch_tag_colors[new_tag]
+            r = int(orig[1:3], 16)
+            g = int(orig[3:5], 16)
+            b = int(orig[5:7], 16)
+            r = min(255, r + 45)
+            g = min(255, g + 45)
+            b = min(255, b + 45)
+            hl = f"#{r:02x}{g:02x}{b:02x}"
+            self._apply_tag_color(canvas, new_tag, hl, hl)
+
+        self._current_hover_tag = new_tag
+
+    @staticmethod
+    def _apply_tag_color(canvas, tag, fill, outline):
+        """Apply fill/outline to every rectangle item with the given tag."""
+        for iid in canvas.find_withtag(tag):
+            if canvas.type(iid) == 'rectangle':
+                canvas.itemconfigure(iid, fill=fill, outline=outline)
 
     def _show_heatmap(self, tensor_idx: int):
         """Show a heatmap popup of the first K*K weights of a tensor."""
@@ -1068,8 +1097,32 @@ class TbmViewerApp:
 
         hc.create_text(pad + (side * CELL) // 2, canvas_h - 6,
                        text=f"{name}  {shape_str}  {sp:.0%} sparse  "
-                            f"[±{max_abs:.3f}]",
+                            f"[max abs = {max_abs:.4f}]",
                        fill="#888888", font=("TkDefaultFont", 8))
+
+        # Explanation
+        expl_frame = ttk.Frame(popup, padding=(8, 4, 8, 8))
+        expl_frame.pack(fill=tk.X)
+
+        mean_val = sum(v for v in vals if math.isfinite(v)) / max(len(vals), 1)
+        non_zero = sum(1 for v in vals if math.isfinite(v) and abs(v) > 1e-8)
+        zero_pct = (1.0 - non_zero / max(len(vals), 1)) * 100
+
+        expl_lines = [
+            f"showing first {side}\u00D7{side} = {count} weight values",
+            f"blue = negative   \u00B7   red = positive   \u00B7   gray = NaN/Inf",
+            f"color saturates at \u00B1{max_abs:.4f} (the max absolute value in this slice)",
+        ]
+        if count >= 4:
+            expl_lines.append(
+                f"mean = {mean_val:+.4f}   \u00B7   "
+                f"{zero_pct:.0f}% zeros ({non_zero}/{count} non-zero)")
+        full = "\n".join(expl_lines)
+        ttk.Label(expl_frame, text=full, justify=tk.LEFT,
+                   font=("TkDefaultFont", 8),
+                   foreground="#aaaaaa", background="#1a1a1a").pack(
+                       fill=tk.X, anchor=tk.W)
+        popup.configure(background="#1a1a1a")
 
 
 # ──────────────────────────────────────────────
