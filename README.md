@@ -21,19 +21,22 @@ A lightweight Python GUI application for inspecting .tbm model container files p
 └─────────────────────┘
 ```
 
-The JSON index enables random-access reading of individual tensors without loading the entire file.
+The JSON index enables random-access reading of individual tensors without loading the entire file into memory.
 
 ## Usage
 
 ```bash
-python tbm_viewer.py [path/to/model.tbm]
+python tbm_viewer.py
 ```
 
-Ctrl+O or File > Open to choose a .tbm file. The left panel lists all tensors with a search/filter bar. Select a tensor to view:
+Click **Open .tbm file...** or press **Ctrl+O** to choose a `.tbm` file.
+
+The left panel lists all tensors with a search/filter bar. Select a tensor to view:
+
 - **Tensor Details** — metadata (name, shape, dtype, N:M sparsity, byte offsets, data sizes)
 - **Weight Preview** — first N floating-point values (configurable, max 1024)
-- **Mask Preview** — first 256 mask bytes in hex
+- **Mask Preview** — first 256 mask bytes in hex dump format
 
 ## License
 
-MIT
+Apache 2.0. See [LICENSE](LICENSE).

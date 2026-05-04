@@ -153,6 +153,7 @@ class TbmViewerApp:
         self.tensors: list[dict] = []
         self.filtered_tensors: list[int] = []
         self.file_size: int = 0
+        self._loaded = False
 
         self._build_ui()
         self._update_summary_panel()
@@ -174,8 +175,31 @@ class TbmViewerApp:
         self.root.bind("<Control-o>", lambda _: self._on_open())
         self.root.bind("<Control-O>", lambda _: self._on_open())
 
-        # -- main paned window --
-        paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+        # -- root container: switches between welcome and main views --
+        self._container = ttk.Frame(root)
+        self._container.pack(fill=tk.BOTH, expand=True)
+
+        # -- welcome screen (visible when no file is loaded) --
+        self._welcome_frame = ttk.Frame(self._container)
+        self._welcome_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        ttk.Label(self._welcome_frame,
+                  text="Tensorbit .tbm Viewer",
+                  font=("TkDefaultFont", 18, "bold")).pack(pady=(0, 8))
+        ttk.Label(self._welcome_frame,
+                  text="Open a .tbm model container file to inspect",
+                  font=("TkDefaultFont", 11)).pack(pady=(0, 24))
+        open_btn = ttk.Button(self._welcome_frame, text="Open .tbm file...",
+                              command=self._on_open)
+        open_btn.pack()
+        ttk.Label(self._welcome_frame,
+                  text="Ctrl+O",
+                  foreground="gray", font=("TkDefaultFont", 9)).pack(pady=(8, 0))
+
+        # -- main UI (hidden until file is loaded) --
+        self._main_frame = ttk.Frame(self._container)
+
+        # main paned window
+        paned = ttk.PanedWindow(self._main_frame, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         # -- left panel: summary + tensor list --
@@ -291,6 +315,16 @@ class TbmViewerApp:
         mask_frame.rowconfigure(0, weight=1)
         mask_frame.columnconfigure(0, weight=1)
 
+    # ── View switching ──────────────────────
+
+    def _show_welcome(self):
+        self._welcome_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self._main_frame.pack_forget()
+
+    def _show_main(self):
+        self._welcome_frame.place_forget()
+        self._main_frame.pack(fill=tk.BOTH, expand=True)
+
     # ── Actions ──────────────────────────────
 
     def _on_open(self):
@@ -316,6 +350,7 @@ class TbmViewerApp:
 
         index = parse_tbm(path)
         if index is None:
+            self._show_welcome()
             messagebox.showerror("Parse Error",
                                  "Failed to parse .tbm file.\n"
                                  "Not a valid .tbm container or file is corrupted.")
@@ -340,6 +375,7 @@ class TbmViewerApp:
                              values=(name, shape_str, nw_str, nm_str))
 
         self.filtered_tensors = list(range(len(self.tensors)))
+        self._show_main()
         self._update_summary_panel()
 
     def _apply_filter(self):
