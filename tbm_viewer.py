@@ -338,9 +338,13 @@ class TbmViewerApp:
         arch_frame.rowconfigure(0, weight=1)
         arch_frame.columnconfigure(0, weight=1)
 
-        self.arch_canvas.bind("<Button-1>", self._on_arch_click)
+        self.arch_canvas.bind("<Enter>", self._on_arch_canvas_enter)
+        self.arch_canvas.bind("<MouseWheel>", self._on_arch_mousewheel)
+        self.arch_canvas.bind("<Button-4>", self._on_arch_mousewheel_linux)
+        self.arch_canvas.bind("<Button-5>", self._on_arch_mousewheel_linux)
         self._arch_data = None
         self._arch_expanded = {}
+        self._arch_hover_color = {}
 
     # ── View switching ──────────────────────
 
@@ -707,8 +711,6 @@ class TbmViewerApp:
         """Draw the architecture diagram on the canvas."""
         canvas = self.arch_canvas
         canvas.delete('all')
-        self._arch_data = None
-        self._arch_expanded = {}
 
         if not self.tensors:
             canvas.create_text(400, 100, text="(no tensors loaded)",
@@ -882,24 +884,30 @@ class TbmViewerApp:
                             lnum=None, expanded=True):
         """Draw a collapsible group header. Returns new y after the header."""
         h = 24
-        r = 6
+        is_layer = lnum is not None
+        tag = f"ghdr_{lnum}" if is_layer else f"ghdr_{text}"
+
         box_id = canvas.create_rectangle(x, y, x + w, y + h,
                                           fill=color, outline=color,
-                                          stipple='gray25' if not expanded else '')
-        toggle = '+' if not expanded else '-'
-        canvas.create_text(x + 14, y + h // 2, text=toggle,
-                           fill="white", font=("TkDefaultFont", 11, "bold"),
-                           anchor=tk.W)
-        canvas.create_text(x + 30, y + h // 2, text=text,
+                                          stipple='gray25' if not expanded else '',
+                                          tags=(tag,))
+        toggle_id = canvas.create_text(x + h // 2, y + h // 2,
+                                        text='-' if expanded else '+',
+                                        fill="white",
+                                        font=("TkDefaultFont", 11, "bold"),
+                                        tags=(tag,))
+        canvas.create_text(x + h + 8, y + h // 2, text=text,
                            fill="white",
                            font=("TkDefaultFont", 10, "bold"),
-                           anchor=tk.W)
-        if lnum is not None:
-            tag = f"layer_hdr_{lnum}"
-            canvas.tag_bind(box_id, "<Button-1>",
+                           anchor=tk.W, tags=(tag,))
+
+        if is_layer:
+            canvas.tag_bind(tag, "<Button-1>",
                             lambda e, ln=lnum: self._toggle_layer(ln))
-            canvas.tag_bind(toggle, "<Button-1>",
-                            lambda e, ln=lnum: self._toggle_layer(ln))
+            canvas.tag_bind(tag, "<Enter>",
+                            lambda e, c=color: self._on_item_enter(e, c))
+            canvas.tag_bind(tag, "<Leave>",
+                            lambda e, c=color: self._on_item_leave(e, c))
         return y + h + 6
 
     def _toggle_layer(self, lnum: int):
@@ -913,21 +921,33 @@ class TbmViewerApp:
         color = TbmViewerApp._color_of(name, group)
         shape = tensor.get('shape', [])
         nw = tensor.get('num_weights', 0)
-        shape_str = '×'.join(str(d) for d in shape) if shape else '?'
-        r = 5
-        box_id = canvas.create_rectangle(x, y, x + w, y + h,
-                                          fill=color, outline=color)
+        shape_str = chr(0x00D7).join(str(d) for d in shape) if shape else '?'
         label = short[:18] + ('..' if len(short) > 18 else '')
+
+        idx = self.tensors.index(tensor) if tensor in self.tensors else -1
+        tag = f"tbox_{idx}"
+        hover_tag = f"hover_tbox_{idx}"
+
+        canvas.create_rectangle(x, y, x + w, y + h,
+                                 fill=color, outline=color,
+                                 tags=(tag,))
         canvas.create_text(x + w // 2, y + h // 2,
                            text=label, fill="white",
-                           font=("TkDefaultFont", 9, "bold"))
-        info = f"{shape_str}  {nw:,}"
+                           font=("TkDefaultFont", 9, "bold"),
+                           tags=(tag,))
         canvas.create_text(x + w // 2, y - 2,
-                           text=info, fill="#999999",
-                           font=("TkDefaultFont", 7), anchor=tk.S)
-        idx = self.tensors.index(tensor) if tensor in self.tensors else -1
-        canvas.tag_bind(box_id, "<Button-1>",
-                        lambda e, i=idx: self._show_heatmap(i))
+                           text=f"{shape_str}  {nw:,}",
+                           fill="#999999",
+                           font=("TkDefaultFont", 7), anchor=tk.S,
+                           tags=(tag,))
+
+        if idx >= 0:
+            canvas.tag_bind(tag, "<Button-1>",
+                            lambda e, i=idx: self._show_heatmap(i))
+            canvas.tag_bind(tag, "<Enter>",
+                            lambda e, c=color: self._on_item_enter(e, c))
+            canvas.tag_bind(tag, "<Leave>",
+                            lambda e, c=color: self._on_item_leave(e, c))
         return y + h
 
     def _draw_arrow(self, canvas, x1, y1, x2, y2):
@@ -935,9 +955,44 @@ class TbmViewerApp:
         canvas.create_line(x1, y1, x2, y2 - 5, fill="#666688", width=2,
                            arrow=tk.LAST, arrowshape=(8, 10, 4))
 
-    def _on_arch_click(self, event):
-        """Handler for canvas clicks — identify item and dispatch."""
-        pass
+    def _on_arch_canvas_enter(self, event):
+        """Focus the canvas so mousewheel events are captured."""
+        self.arch_canvas.focus_set()
+
+    def _on_arch_mousewheel(self, event):
+        """Mouse wheel scrolling (Windows/macOS)."""
+        self.arch_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_arch_mousewheel_linux(self, event):
+        """Mouse wheel scrolling (Linux, X11)."""
+        if event.num == 4:
+            self.arch_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.arch_canvas.yview_scroll(1, "units")
+
+    def _on_item_enter(self, event, orig_color):
+        """Brighten a canvas item on mouse hover."""
+        items = self.arch_canvas.find_withtag("current")
+        for item_id in items:
+            item_type = self.arch_canvas.type(item_id)
+            if item_type == "rectangle":
+                r = int(orig_color[1:3], 16)
+                g = int(orig_color[3:5], 16)
+                b = int(orig_color[5:7], 16)
+                r = min(255, r + 40)
+                g = min(255, g + 40)
+                b = min(255, b + 40)
+                hl = f"#{r:02x}{g:02x}{b:02x}"
+                self.arch_canvas.itemconfigure(item_id, fill=hl, outline=hl)
+
+    def _on_item_leave(self, event, orig_color):
+        """Restore original color on mouse leave."""
+        items = self.arch_canvas.find_withtag("current")
+        for item_id in items:
+            item_type = self.arch_canvas.type(item_id)
+            if item_type == "rectangle":
+                self.arch_canvas.itemconfigure(item_id, fill=orig_color,
+                                                outline=orig_color)
 
     def _show_heatmap(self, tensor_idx: int):
         """Show a heatmap popup of the first K*K weights of a tensor."""
