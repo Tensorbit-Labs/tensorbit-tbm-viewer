@@ -176,7 +176,7 @@ class TbmViewerApp:
         self.root.bind("<Control-O>", lambda _: self._on_open())
 
         # -- root container: switches between welcome and main views --
-        self._container = ttk.Frame(root)
+        self._container = ttk.Frame(self.root)
         self._container.pack(fill=tk.BOTH, expand=True)
 
         # -- welcome screen (visible when no file is loaded) --
@@ -273,7 +273,7 @@ class TbmViewerApp:
         self.notebook.add(weight_frame, text="Weight Preview")
 
         wctrl = ttk.Frame(weight_frame)
-        wctrl.pack(fill=tk.X, pady=(0, 4))
+        wctrl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         ttk.Label(wctrl, text="Show first").pack(side=tk.LEFT)
         self.preview_count_var = tk.StringVar(value="128")
         pc_entry = ttk.Entry(wctrl, textvariable=self.preview_count_var,
@@ -291,10 +291,10 @@ class TbmViewerApp:
                                     command=self.weight_text.xview)
         self.weight_text.configure(yscrollcommand=w_scroll_y.set,
                                    xscrollcommand=w_scroll_x.set)
-        self.weight_text.grid(row=1, column=0, sticky="nsew")
-        w_scroll_y.grid(row=1, column=1, sticky="ns")
-        w_scroll_x.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        weight_frame.rowconfigure(1, weight=1)
+        self.weight_text.grid(row=2, column=0, sticky="nsew")
+        w_scroll_y.grid(row=2, column=1, sticky="ns")
+        w_scroll_x.grid(row=1, column=0, sticky="ew")
+        weight_frame.rowconfigure(2, weight=1)
         weight_frame.columnconfigure(0, weight=1)
 
         # tab: mask preview
